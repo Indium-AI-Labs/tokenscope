@@ -8,7 +8,7 @@ No runtime network calls are made unless you explicitly request a HuggingFace Hu
 
 ## Release
 
-The v0.1.0 changelog is in [changelogs/changelog_v0.1.0.md](changelogs/changelog_v0.1.0.md).
+The v0.2.0 changelog is in [changelogs/changelog_v0.2.0.md](changelogs/changelog_v0.2.0.md). Older release notes are kept in [changelogs/](changelogs/).
 
 Prebuilt Linux and Windows binaries are attached to GitHub Releases. macOS binaries are built by the macOS GitHub Actions runner or on a macOS host.
 
