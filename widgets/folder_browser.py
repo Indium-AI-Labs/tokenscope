@@ -3,9 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable
 
-from textual.containers import Vertical
+from textual.containers import Horizontal, Vertical
 from textual.message import Message
-from textual.widgets import DataTable, DirectoryTree, Label, LoadingIndicator, Static
+from textual.widgets import Button, DataTable, DirectoryTree, Input, Label, LoadingIndicator, Static
 
 
 class BrowserDirectoryTree(DirectoryTree):
@@ -28,6 +28,11 @@ class FolderBrowser(Vertical):
             self.path = path
             super().__init__()
 
+    class HubDownloadRequested(Message):
+        def __init__(self, model_id: str) -> None:
+            self.model_id = model_id
+            super().__init__()
+
     DEFAULT_ALLOWED_SUFFIXES = {".txt", ".md", ".jsonl", ".json", ".csv"}
 
     def __init__(self, *args, **kwargs) -> None:
@@ -37,6 +42,9 @@ class FolderBrowser(Vertical):
     def compose(self):
         yield Label("Select tokenizer folder", id="browser-title")
         yield Static("", id="browser-help")
+        with Horizontal(id="hub-controls"):
+            yield Input(placeholder="HuggingFace Hub model ID (e.g., gpt2)", id="hub-model-id")
+            yield Button("Load from Hub", id="hub-load")
         yield Static("", id="browser-root")
         yield DataTable(id="recent-tokenizers")
         yield BrowserDirectoryTree(Path.cwd(), id="folder-tree")
@@ -57,6 +65,7 @@ class FolderBrowser(Vertical):
         root: Path | str | None = None,
         *,
         allow_files: bool = False,
+        allow_hub: bool = True,
         allowed_suffixes: set[str] | None = None,
         recent_paths: Iterable[str | Path] | None = None,
     ) -> None:
@@ -70,6 +79,12 @@ class FolderBrowser(Vertical):
         tree = self.query_one("#folder-tree", BrowserDirectoryTree)
         tree.show_files = allow_files
         tree.allowed_suffixes = allowed_suffixes or self.DEFAULT_ALLOWED_SUFFIXES
+        hub_controls = self.query_one("#hub-controls", Horizontal)
+        if allow_hub:
+            hub_controls.remove_class("hidden")
+        else:
+            hub_controls.add_class("hidden")
+            self.query_one("#hub-model-id", Input).value = ""
         self.set_recent_paths(recent_paths or [])
         self.set_root(root_path)
         self.set_status("")
@@ -136,3 +151,17 @@ class FolderBrowser(Vertical):
         event.stop()
         if 0 <= event.cursor_row < len(self._recent_paths):
             self.post_message(self.FolderSelected(self._recent_paths[event.cursor_row]))
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "hub-load":
+            event.stop()
+            model_id = self.query_one("#hub-model-id", Input).value.strip()
+            if model_id:
+                self.post_message(self.HubDownloadRequested(model_id))
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "hub-model-id":
+            event.stop()
+            model_id = event.value.strip()
+            if model_id:
+                self.post_message(self.HubDownloadRequested(model_id))

@@ -17,6 +17,7 @@ from analysis_models import (
     CorpusAnalysisResult,
     CorpusCompareResult,
     ExportFormat,
+    PROJECT_SCHEMA_VERSION,
     PricingProfile,
     ProjectState,
     RegressionSuiteResult,
@@ -42,6 +43,7 @@ from analysis_models import (
     suggest_tokenizer_repairs,
 )
 from compare_engine import CompareResult, build_compare_result
+from config import load_config
 from theme import APP_CSS
 from tokenizer_engine import TokenizationResult, TokenizerEngine, TokenizerLoadError
 from version import __version__, app_version_label
@@ -70,6 +72,7 @@ class TokenscopeApp(App[None]):
         Binding("ctrl+f", "focus_token_search", "Search tokens"),
         Binding("ctrl+b", "focus_budget_input", "Prompt budget"),
         Binding("ctrl+t", "toggle_encode_special_tokens", "Toggle special encoding"),
+        Binding("ctrl+y", "copy_to_clipboard", "Copy token IDs"),
         Binding("backspace", "browser_parent", "Parent folder", show=False),
         Binding("escape", "cancel_browser", "Cancel browser", show=False),
     ]
@@ -83,6 +86,7 @@ class TokenscopeApp(App[None]):
         budget_limit: int | None = None,
         export_format: ExportFormat = "json",
         project_state: ProjectState | None = None,
+        encode_special_tokens: bool = False,
     ) -> None:
         super().__init__()
         if project_state is not None:
@@ -116,7 +120,11 @@ class TokenscopeApp(App[None]):
         self._batch_task: asyncio.Task[None] | None = None
         self._corpus_compare_task: asyncio.Task[None] | None = None
         self._encode_sequence = 0
-        self.encode_special_tokens = project_state.encode_special_tokens if project_state is not None else False
+        self.encode_special_tokens = (
+            project_state.encode_special_tokens
+            if project_state is not None
+            else encode_special_tokens
+        )
         self.selected_token_indices = {"primary": 0, "compare": 0}
         self.search_matches: dict[str, tuple[TokenSearchMatch, ...]] = {"primary": (), "compare": ()}
         self.budget_limit = budget_limit
@@ -174,6 +182,27 @@ class TokenscopeApp(App[None]):
             self._request_batch_analysis(event.path)
             return
         self._request_tokenizer_load(str(event.path), self.browser_mode, from_cli=False)
+
+    async def on_folder_browser_hub_download_requested(self, event: FolderBrowser.HubDownloadRequested) -> None:
+        event.stop()
+        browser = self.query_one("#folder-browser", FolderBrowser)
+        if self.browser_mode not in ("primary", "compare"):
+            browser.set_status("Hub downloads are only available when loading tokenizers.")
+            return
+        browser.set_status(f"Downloading from Hub: {event.model_id}...")
+        browser.set_loading(True)
+        try:
+            config = load_config()
+            engine = await asyncio.to_thread(
+                TokenizerEngine.load_from_hub,
+                event.model_id,
+                cache_dir=config.hub_cache_dir
+            )
+            self._request_tokenizer_load(str(engine.source_path), self.browser_mode, from_cli=False)
+        except Exception as exc:
+            browser.set_status(f"Hub download failed: {exc}")
+        finally:
+            browser.set_loading(False)
 
     def on_debounced_text_input_debounced(self, event: DebouncedTextInput.Debounced) -> None:
         event.stop()
@@ -307,6 +336,7 @@ class TokenscopeApp(App[None]):
             help_text,
             default_root,
             allow_files=allow_files,
+            allow_hub=mode in ("primary", "compare"),
             recent_paths=recent_paths,
         )
         self.query_one("#browser-screen", Container).remove_class("hidden")
@@ -431,6 +461,7 @@ class TokenscopeApp(App[None]):
             self.corpus_compare_result
         )
         self.query_one("#bottom-panel", MergeTreeWidget).set_batch_result(self.batch_result)
+        self.query_one("#stats-panel", StatsPanel).set_budget_limit(self.budget_limit)
         if self.compare_engine is None:
             self.query_one("#compare-token-view", TokenView).add_class("hidden")
         else:
@@ -445,7 +476,27 @@ class TokenscopeApp(App[None]):
                 label += f" | compare: {self._engine_label(self.compare_engine)}"
             if self.encode_special_tokens:
                 label += " | encode specials: on"
+            budget_badge = self._budget_badge()
+            if budget_badge:
+                label += f" | {budget_badge}"
         self.query_one("#header", Static).update(label)
+
+    def _budget_badge(self) -> str:
+        """Return a color-coded budget badge for the header, or empty string."""
+        if self.budget_limit is None or self.budget_limit <= 0:
+            return ""
+        if self.primary_result is None:
+            return ""
+        used = self.primary_result.stats.token_count
+        pct = (used / self.budget_limit) * 100.0
+        remaining = self.budget_limit - used
+        if pct > 100:
+            return f"[bold red]OVER BUDGET {used:,}/{self.budget_limit:,} ({pct:.0f}%)[/bold red]"
+        if pct >= 95:
+            return f"[red]budget: {used:,}/{self.budget_limit:,} ({pct:.0f}%)[/red]"
+        if pct >= 80:
+            return f"[yellow]budget: {used:,}/{self.budget_limit:,} ({pct:.0f}%)[/yellow]"
+        return f"[green]budget: {used:,}/{self.budget_limit:,} ({pct:.0f}%)[/green]"
 
     @staticmethod
     def _engine_label(engine: TokenizerEngine) -> str:
@@ -471,6 +522,9 @@ class TokenscopeApp(App[None]):
     def on_merge_tree_widget_budget_changed(self, event: MergeTreeWidget.BudgetChanged) -> None:
         event.stop()
         self.budget_limit = event.limit
+        self.query_one("#stats-panel", StatsPanel).set_budget_limit(self.budget_limit)
+        self._render_results()
+        self._update_header()
 
     def on_merge_tree_widget_export_format_changed(
         self,
@@ -586,6 +640,21 @@ class TokenscopeApp(App[None]):
         state = "on" if self.encode_special_tokens else "off"
         self.notify(f"Encode special tokens: {state}")
 
+    def action_copy_to_clipboard(self) -> None:
+        """Copy current token IDs to the system clipboard."""
+        if self.primary_result is None:
+            self.notify("Nothing to copy yet.", severity="warning")
+            return
+        ids_text = " ".join(str(tid) for tid in self.primary_result.token_ids)
+        try:
+            import pyperclip  # type: ignore[import-untyped]
+            pyperclip.copy(ids_text)
+            self.notify(f"Copied {len(self.primary_result.token_ids)} token IDs to clipboard.")
+        except ImportError:
+            self.notify("pyperclip not installed. Install with: pip install pyperclip", severity="warning")
+        except Exception as exc:
+            self.notify(f"Clipboard copy failed: {exc}", severity="error")
+
     def _move_selected_token(self, delta: int) -> None:
         if self.query_one("#main-layout", Vertical).has_class("hidden"):
             return
@@ -629,7 +698,7 @@ class TokenscopeApp(App[None]):
         tokenizer_path = str(self.primary_engine.source_path) if self.primary_engine is not None else self.initial_tokenizer_path
         compare_path = str(self.compare_engine.source_path) if self.compare_engine is not None else self.pending_compare_tokenizer_path
         return ProjectState(
-            version=1,
+            version=PROJECT_SCHEMA_VERSION,
             tokenizer_path=tokenizer_path,
             compare_tokenizer_path=compare_path,
             input_text=self.query_one("#text-input", DebouncedTextInput).value,
@@ -642,6 +711,7 @@ class TokenscopeApp(App[None]):
             batch_path=self.current_batch_path or self.pending_batch_path,
             active_tab=str(getattr(tabs, "active", "token-table-tab")),
             selected_source=bottom.selected_source,
+            pricing_profile=bottom.cost_profile,
         )
 
     def _apply_project_state(self, project: ProjectState) -> None:
@@ -923,13 +993,22 @@ def run_headless_analyze(args: argparse.Namespace) -> int:
 def _read_headless_input(args: argparse.Namespace) -> str:
     if args.input_file:
         return Path(args.input_file).expanduser().read_text(encoding="utf-8")
-    return str(args.input or "")
+    if args.input:
+        return str(args.input)
+    # Read from stdin if piped (not a TTY) or --stdin was explicitly set.
+    if getattr(args, "stdin", False) or (not sys.stdin.isatty()):
+        return sys.stdin.read()
+    return ""
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Offline tokenizer explorer TUI.")
     parser.add_argument("--version", action="version", version=f"tokenscope {__version__}")
     parser.add_argument("--tokenizer", help="Local tokenizer directory or tokenizer.json path.")
+    parser.add_argument(
+        "--hub",
+        help="HuggingFace Hub model ID to download and load (e.g., meta-llama/Llama-3.1-8B).",
+    )
     parser.add_argument(
         "--compare-tokenizer",
         help="Optional local tokenizer directory or tokenizer.json path to compare.",
@@ -952,7 +1031,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--export-format",
         choices=("json", "csv", "md", "html"),
-        default="json",
+        default=None,
         help="Default Ctrl+S export format.",
     )
     parser.add_argument(
@@ -961,11 +1040,19 @@ def parse_args() -> argparse.Namespace:
     )
 
     subparsers = parser.add_subparsers(dest="command")
+    init_cfg = subparsers.add_parser("init-config", help="Initialize a default .tokenscoperc configuration file.")
+    init_cfg.add_argument("--path", help="Custom path/filename to write the configuration file to.")
+
     analyze = subparsers.add_parser("analyze", help="Run headless tokenizer analysis.")
-    analyze.add_argument("--tokenizer", required=True, help="Local tokenizer directory or tokenizer.json path.")
+    analyze.add_argument("--tokenizer", help="Local tokenizer directory or tokenizer.json path.")
+    analyze.add_argument(
+        "--hub",
+        help="HuggingFace Hub model ID to download and load.",
+    )
     analyze.add_argument("--compare-tokenizer", help="Optional tokenizer to compare.")
     analyze.add_argument("--input", default="", help="Inline text to tokenize.")
     analyze.add_argument("--input-file", help="Local UTF-8 text file to tokenize.")
+    analyze.add_argument("--stdin", action="store_true", help="Read input text from stdin.")
     analyze.add_argument("--file", dest="corpus_path", help="Optional local corpus file or folder.")
     analyze.add_argument("--batch", dest="batch_path", help="Optional local prompt file or folder.")
     analyze.add_argument("--budget", type=int, help="Prompt budget token limit.")
@@ -973,7 +1060,7 @@ def parse_args() -> argparse.Namespace:
     analyze.add_argument(
         "--export-format",
         choices=("json", "csv", "md", "html"),
-        default="json",
+        default=None,
         help="Output report format.",
     )
     analyze.add_argument("--fail-on-budget", action="store_true", help="Exit nonzero when budget is exceeded.")
@@ -987,9 +1074,60 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _resolve_tokenizer_path(
+    args: argparse.Namespace,
+    config=None,
+) -> str | None:
+    """Resolve --tokenizer or --hub into a local path."""
+    if getattr(args, "tokenizer", None):
+        return args.tokenizer
+    hub_id = getattr(args, "hub", None)
+    if hub_id:
+        config = config or load_config()
+        engine = TokenizerEngine.load_from_hub(
+            hub_id,
+            cache_dir=config.hub_cache_dir,
+        )
+        return str(engine.source_path)
+    return None
+
+
 def main() -> None:
     args = parse_args()
+
+    if args.command == "init-config":
+        from config import TokenScopeConfig, save_config
+        target_path = Path(args.path) if args.path else None
+        try:
+            save_config(TokenScopeConfig(), target_path)
+            dest = target_path or (Path.cwd() / ".tokenscoperc")
+            print(f"Successfully initialized default configuration file at {dest}")
+        except Exception as exc:
+            print(f"Error: Failed to write configuration file: {exc}", file=sys.stderr)
+            raise SystemExit(1)
+        raise SystemExit(0)
+
+    # Load config file defaults.
+    config = load_config()
+
     if args.command == "analyze":
+        if not args.tokenizer and not args.hub:
+            if config.default_tokenizer:
+                args.tokenizer = config.default_tokenizer
+            elif config.default_hub_model:
+                args.hub = config.default_hub_model
+        args.compare_tokenizer = args.compare_tokenizer or config.default_compare_tokenizer
+        args.corpus_path = args.corpus_path or config.default_corpus_path
+        args.batch_path = args.batch_path or config.default_batch_path
+        args.budget = args.budget if args.budget is not None else config.default_budget
+        args.export_format = args.export_format or config.default_export_format or "json"
+        # Resolve hub before headless analysis.
+        tokenizer_path = _resolve_tokenizer_path(args, config)
+        if tokenizer_path:
+            args.tokenizer = tokenizer_path
+        if not args.tokenizer:
+            print("Error: --tokenizer or --hub is required for analyze mode.", file=sys.stderr)
+            raise SystemExit(1)
         raise SystemExit(run_headless_analyze(args))
 
     project_state = load_project_state(args.project) if args.project else None
@@ -1001,14 +1139,39 @@ def main() -> None:
         args.batch_path = args.batch_path or project_state.batch_path
         args.budget = args.budget if args.budget is not None else project_state.budget_limit
 
+    # Apply config defaults where CLI didn't specify.
+    tokenizer_path = args.tokenizer
+    hub_id = getattr(args, "hub", None)
+    if not tokenizer_path and hub_id:
+        engine = TokenizerEngine.load_from_hub(hub_id, cache_dir=config.hub_cache_dir)
+        tokenizer_path = str(engine.source_path)
+    if not tokenizer_path and config.default_tokenizer:
+        tokenizer_path = config.default_tokenizer
+    if not tokenizer_path and config.default_hub_model:
+        try:
+            engine = TokenizerEngine.load_from_hub(
+                config.default_hub_model,
+                cache_dir=config.hub_cache_dir,
+            )
+            tokenizer_path = str(engine.source_path)
+        except Exception:
+            pass
+
+    export_format = args.export_format or config.default_export_format or "json"
+    budget = args.budget if args.budget is not None else config.default_budget
+    compare_tokenizer = getattr(args, "compare_tokenizer", None) or config.default_compare_tokenizer
+    corpus_path = getattr(args, "corpus_path", None) or config.default_corpus_path
+    batch_path = getattr(args, "batch_path", None) or config.default_batch_path
+
     TokenscopeApp(
-        tokenizer_path=args.tokenizer,
-        compare_tokenizer_path=args.compare_tokenizer,
-        corpus_path=args.corpus_path,
-        batch_path=args.batch_path,
-        budget_limit=args.budget,
-        export_format=args.export_format,
+        tokenizer_path=tokenizer_path,
+        compare_tokenizer_path=compare_tokenizer,
+        corpus_path=corpus_path,
+        batch_path=batch_path,
+        budget_limit=budget,
+        export_format=export_format,
         project_state=project_state,
+        encode_special_tokens=config.encode_special_tokens,
     ).run()
 
 

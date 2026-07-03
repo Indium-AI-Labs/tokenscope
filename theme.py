@@ -137,7 +137,8 @@ TabPane {
 #unicode-table,
 #rag-table,
 #distribution-table,
-#repair-table {
+#repair-table,
+#benchmark-table {
     height: 1fr;
 }
 
@@ -149,7 +150,8 @@ TabPane {
 #packing-controls,
 #regression-controls,
 #rag-controls,
-#cost-controls {
+#cost-controls,
+#hub-controls {
     height: 3;
 }
 
@@ -179,7 +181,8 @@ TabPane {
 #rag-overlap-tokens,
 #cost-input-price,
 #cost-output-price,
-#cost-output-tokens {
+#cost-output-tokens,
+#hub-model-id {
     height: 3;
     margin-bottom: 1;
 }
@@ -201,7 +204,8 @@ TabPane {
 #rag-summary,
 #distribution-summary,
 #cost-summary,
-#repair-summary {
+#repair-summary,
+#benchmark-summary {
     height: auto;
     min-height: 3;
 }
@@ -225,7 +229,26 @@ TabPane {
 #project-save,
 #regression-run,
 #regression-add-current,
-#repair-write-preview {
+#repair-write-preview,
+#benchmark-run,
+#hub-load {
     height: 3;
+}
+
+.budget-ok {
+    color: #7ee787;
+}
+
+.budget-warning {
+    color: #f2cc60;
+}
+
+.budget-danger {
+    color: #ff8cc6;
+}
+
+.budget-exceeded {
+    color: #ff4444;
+    text-style: bold;
 }
 """

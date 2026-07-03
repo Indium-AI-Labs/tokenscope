@@ -6,7 +6,7 @@ import io
 import json
 import unicodedata
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Literal, Sequence
 
@@ -22,7 +22,7 @@ SUPPORTED_CORPUS_SUFFIXES = {".txt", ".md", ".jsonl", ".json", ".csv"}
 RECENT_TOKENIZER_FILE = ".tokenscope_recent.json"
 PRICING_PROFILE_FILE = ".tokenscope_pricing.json"
 MAX_RECENT_TOKENIZERS = 10
-PROJECT_SCHEMA_VERSION = 1
+PROJECT_SCHEMA_VERSION = 2
 REGRESSION_SCHEMA_VERSION = 1
 ZERO_WIDTH_CODEPOINTS = {
     "\u200b",
@@ -230,6 +230,18 @@ class CorpusCompareResult:
 
 
 @dataclass(frozen=True)
+class PricingProfile:
+    name: str
+    input_per_million: float
+    output_per_million: float
+    estimated_output_tokens: int
+
+
+def default_pricing_profile() -> PricingProfile:
+    return PricingProfile("custom", 0.0, 0.0, 0)
+
+
+@dataclass(frozen=True)
 class ProjectState:
     version: int
     tokenizer_path: str | None
@@ -244,6 +256,7 @@ class ProjectState:
     batch_path: str | None
     active_tab: str
     selected_source: str
+    pricing_profile: PricingProfile = field(default_factory=default_pricing_profile)
 
 
 @dataclass(frozen=True)
@@ -409,14 +422,6 @@ class DistributionResult:
 
 
 @dataclass(frozen=True)
-class PricingProfile:
-    name: str
-    input_per_million: float
-    output_per_million: float
-    estimated_output_tokens: int
-
-
-@dataclass(frozen=True)
 class CostEstimate:
     profile_name: str
     input_tokens: int
@@ -438,6 +443,26 @@ class TokenizerRepairResult:
     tokenizer_path: str
     suggestion_count: int
     suggestions: tuple[RepairSuggestion, ...]
+
+
+@dataclass(frozen=True)
+class BenchmarkResult:
+    source: str
+    tokenizer_name: str
+    input_chars: int
+    output_tokens: int
+    iterations: int
+    total_seconds: float
+    mean_seconds: float
+    tokens_per_second: float
+    chars_per_second: float
+
+
+@dataclass(frozen=True)
+class BenchmarkComparison:
+    primary: BenchmarkResult
+    compare: BenchmarkResult | None
+    speedup: float | None
 
 
 def inspect_token(
@@ -891,6 +916,7 @@ def load_project_state(path_value: str | Path) -> ProjectState:
         batch_path=_optional_str(payload.get("batch_path")),
         active_tab=str(payload.get("active_tab", "token-table-tab")),
         selected_source=str(payload.get("selected_source", "primary")),
+        pricing_profile=_pricing_profile_from_payload(payload.get("pricing_profile")) or default_pricing_profile(),
     )
 
 
@@ -1315,24 +1341,21 @@ def estimate_token_cost(
 def load_pricing_profiles(workspace: Path | None = None) -> tuple[PricingProfile, ...]:
     path = (workspace or Path.cwd()) / PRICING_PROFILE_FILE
     if not path.exists():
-        return (PricingProfile("custom", 0.0, 0.0, 0),)
+        return (default_pricing_profile(),)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return (PricingProfile("custom", 0.0, 0.0, 0),)
+        return (default_pricing_profile(),)
     profiles: list[PricingProfile] = []
+    seen_names: set[str] = set()
     values = payload if isinstance(payload, list) else payload.get("profiles", []) if isinstance(payload, dict) else []
     for item in values:
-        if isinstance(item, dict):
-            profiles.append(
-                PricingProfile(
-                    name=str(item.get("name", "custom")),
-                    input_per_million=float(item.get("input_per_million", 0.0)),
-                    output_per_million=float(item.get("output_per_million", 0.0)),
-                    estimated_output_tokens=int(item.get("estimated_output_tokens", 0)),
-                )
-            )
-    return tuple(profiles or (PricingProfile("custom", 0.0, 0.0, 0),))
+        profile = _pricing_profile_from_payload(item)
+        if profile is None or profile.name in seen_names:
+            continue
+        profiles.append(profile)
+        seen_names.add(profile.name)
+    return tuple(profiles or (default_pricing_profile(),))
 
 
 def save_pricing_profiles(profiles: Sequence[PricingProfile], workspace: Path | None = None) -> None:
@@ -1810,6 +1833,24 @@ def _optional_positive_int(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return number if number > 0 else None
+
+
+def _pricing_profile_from_payload(value: Any) -> PricingProfile | None:
+    if not isinstance(value, dict):
+        return None
+    try:
+        name = str(value.get("name", "custom")).strip() or "custom"
+        input_per_million = max(0.0, float(value.get("input_per_million", 0.0)))
+        output_per_million = max(0.0, float(value.get("output_per_million", 0.0)))
+        estimated_output_tokens = max(0, int(value.get("estimated_output_tokens", 0)))
+    except (TypeError, ValueError):
+        return None
+    return PricingProfile(
+        name=name,
+        input_per_million=input_per_million,
+        output_per_million=output_per_million,
+        estimated_output_tokens=estimated_output_tokens,
+    )
 
 
 def _append_diff_items(

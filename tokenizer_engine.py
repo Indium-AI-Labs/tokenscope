@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -11,6 +13,8 @@ from jinja2 import StrictUndefined
 from jinja2.sandbox import SandboxedEnvironment
 from tokenizers import Tokenizer
 from tokenizers.implementations import BertWordPieceTokenizer, ByteLevelBPETokenizer
+
+from version import app_version_label
 
 
 class TokenizerLoadError(ValueError):
@@ -148,6 +152,52 @@ class TokenizerEngine:
             loaded_tokenizer_file=loaded_tokenizer_file,
             config_files_found=config_files_found,
         )
+
+    @classmethod
+    def load_from_hub(
+        cls,
+        model_id: str,
+        cache_dir: str | Path | None = None,
+    ) -> "TokenizerEngine":
+        """Download tokenizer files from HuggingFace Hub and load them locally.
+
+        Requires the ``huggingface_hub`` package. The download is cached so
+        subsequent loads of the same *model_id* are instant.
+        """
+        try:
+            from huggingface_hub import snapshot_download  # type: ignore[import-untyped]
+        except ImportError as exc:
+            raise TokenizerLoadError(
+                "huggingface_hub is required for Hub downloads. "
+                "Install it with: pip install huggingface_hub"
+            ) from exc
+
+        allow_patterns = [
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "added_tokens.json",
+            "vocab.json",
+            "vocab.txt",
+            "merges.txt",
+            "config.json",
+        ]
+
+        logger = logging.getLogger("tokenscope")
+        logger.info("Downloading tokenizer from Hub: %s", model_id)
+
+        try:
+            local_dir = snapshot_download(
+                repo_id=model_id,
+                allow_patterns=allow_patterns,
+                cache_dir=str(cache_dir) if cache_dir else None,
+            )
+        except Exception as exc:
+            raise TokenizerLoadError(
+                f"Failed to download tokenizer from Hub ({model_id}): {exc}"
+            ) from exc
+
+        return cls.load(local_dir)
 
     @staticmethod
     def _find_tokenizer_json(root: Path) -> Path | None:
@@ -292,7 +342,7 @@ class TokenizerEngine:
     @property
     def header_label(self) -> str:
         return (
-            f"tokenscope v0.1 | {self.name} | "
+            f"{app_version_label()} | {self.name} | "
             f"{self.tokenizer_type} | vocab: {self.vocab_size}"
         )
 
@@ -488,6 +538,47 @@ class TokenizerEngine:
         skip_special_tokens: bool = False,
     ) -> str:
         return self.tokenizer.decode(list(token_ids), skip_special_tokens=skip_special_tokens)
+
+    def benchmark(self, text: str, *, iterations: int = 10) -> dict[str, object]:
+        """Time tokenization of *text* over *iterations* runs.
+
+        Returns a dict suitable for constructing a ``BenchmarkResult``.
+        """
+        if not text:
+            return {
+                "source": "primary",
+                "tokenizer_name": self.name,
+                "input_chars": 0,
+                "output_tokens": 0,
+                "iterations": 0,
+                "total_seconds": 0.0,
+                "mean_seconds": 0.0,
+                "tokens_per_second": 0.0,
+                "chars_per_second": 0.0,
+            }
+
+        # Warmup run (excluded from timing).
+        warmup = self.encode(text)
+        token_count = warmup.stats.token_count
+        char_count = len(text)
+
+        start = time.perf_counter()
+        for _ in range(iterations):
+            self.encode(text)
+        elapsed = time.perf_counter() - start
+
+        mean = elapsed / iterations if iterations else elapsed
+        return {
+            "source": "primary",
+            "tokenizer_name": self.name,
+            "input_chars": char_count,
+            "output_tokens": token_count,
+            "iterations": iterations,
+            "total_seconds": elapsed,
+            "mean_seconds": mean,
+            "tokens_per_second": (token_count / mean) if mean > 0 else 0.0,
+            "chars_per_second": (char_count / mean) if mean > 0 else 0.0,
+        }
 
     def render_bpe_merge_tree(self, result: TokenizationResult | None, max_tokens: int = 24) -> str:
         if not self.is_bpe:

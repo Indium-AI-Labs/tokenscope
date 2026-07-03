@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -29,10 +30,12 @@ from analysis_models import (
     inspect_token,
     inspect_unicode,
     load_project_state,
+    load_pricing_profiles,
     load_recent_tokenizers,
     pipeline_debug,
     run_regression_suite,
     save_project_state,
+    save_pricing_profiles,
     search_tokens,
     simulate_packing,
     suggest_tokenizer_repairs,
@@ -324,7 +327,7 @@ class AnalysisModelTests(unittest.TestCase):
     def test_project_state_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project = ProjectState(
-                version=1,
+                version=2,
                 tokenizer_path="tok",
                 compare_tokenizer_path="compare",
                 input_text="hello",
@@ -337,6 +340,7 @@ class AnalysisModelTests(unittest.TestCase):
                 batch_path="batch",
                 active_tab="unicode-tab",
                 selected_source="compare",
+                pricing_profile=PricingProfile("team", 1.25, 2.5, 128),
             )
             path = Path(tmp) / "project.json"
 
@@ -347,6 +351,62 @@ class AnalysisModelTests(unittest.TestCase):
             self.assertTrue(loaded.encode_special_tokens)
             self.assertEqual(loaded.chat_messages[0].content, "hello")
             self.assertEqual(loaded.active_tab, "unicode-tab")
+            self.assertEqual(loaded.pricing_profile.name, "team")
+            self.assertEqual(loaded.pricing_profile.input_per_million, 1.25)
+
+    def test_project_state_v1_defaults_cost_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "legacy_project.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "tokenizer_path": "tok",
+                        "input_text": "hello",
+                        "chat_messages": [{"role": "user", "content": "hello"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = load_project_state(path)
+
+            self.assertEqual(loaded.version, 1)
+            self.assertEqual(loaded.pricing_profile.name, "custom")
+            self.assertEqual(loaded.pricing_profile.input_per_million, 0.0)
+            self.assertEqual(loaded.pricing_profile.output_per_million, 0.0)
+            self.assertEqual(loaded.pricing_profile.estimated_output_tokens, 0)
+
+    def test_pricing_profiles_round_trip_and_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            profiles = (
+                PricingProfile("cheap", 1.5, 2.25, 300),
+                PricingProfile("expensive", 10.0, 20.0, 1000),
+            )
+
+            save_pricing_profiles(profiles, workspace)
+            loaded = load_pricing_profiles(workspace)
+
+            self.assertEqual(loaded, profiles)
+
+            (workspace / ".tokenscope_pricing.json").write_text("{bad json", encoding="utf-8")
+            fallback = load_pricing_profiles(workspace)
+            self.assertEqual(fallback, (PricingProfile("custom", 0.0, 0.0, 0),))
+
+            (workspace / ".tokenscope_pricing.json").write_text(
+                json.dumps(
+                    {
+                        "profiles": [
+                            {"name": "valid", "input_per_million": 1, "output_per_million": 2, "estimated_output_tokens": 3},
+                            {"name": "invalid", "input_per_million": "nope"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loaded = load_pricing_profiles(workspace)
+            self.assertEqual(loaded, (PricingProfile("valid", 1.0, 2.0, 3),))
 
     def test_next_feature_analyzers_and_export_sections(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

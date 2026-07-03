@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import asdict
 from pathlib import Path
@@ -14,6 +15,8 @@ from textual.widgets import Button, DataTable, Input, Select, Static, TabPane, T
 
 from analysis_models import (
     BatchPromptAnalysisResult,
+    BenchmarkComparison,
+    BenchmarkResult,
     ChatBudgetResult,
     ChatMessage,
     CorpusAnalysisResult,
@@ -43,6 +46,7 @@ from analysis_models import (
     extract_special_tokens,
     inspect_token,
     inspect_unicode,
+    load_pricing_profiles,
     load_regression_suite,
     pipeline_debug,
     regression_case_from_result,
@@ -50,6 +54,7 @@ from analysis_models import (
     search_tokens,
     simulate_packing,
     suggest_tokenizer_repairs,
+    save_pricing_profiles,
     write_repair_preview,
     tokenizer_metadata,
 )
@@ -83,6 +88,7 @@ class MergeTreeWidget(Vertical):
         "search-tab",
         "merge-tree-tab",
         "vocab-search-tab",
+        "benchmark-tab",
     )
 
     BUDGET_OPTIONS = (
@@ -173,7 +179,8 @@ class MergeTreeWidget(Vertical):
         self.rag_max_tokens = 256
         self.rag_overlap_tokens = 32
         self.rag_mode = "token"
-        self.cost_profile = PricingProfile("custom", 0.0, 0.0, 0)
+        self.cost_profiles = list(load_pricing_profiles(Path.cwd()))
+        self.cost_profile = self.cost_profiles[0]
         self._active_index = 0
         self._updating_controls = False
 
@@ -302,9 +309,31 @@ class MergeTreeWidget(Vertical):
                 yield DataTable(id="distribution-table")
             with TabPane("Cost", id=self.TAB_IDS[18]):
                 with Horizontal(id="cost-controls"):
-                    yield Input(value="0", placeholder="Input cost / 1M", id="cost-input-price")
-                    yield Input(value="0", placeholder="Output cost / 1M", id="cost-output-price")
-                    yield Input(value="0", placeholder="Output tokens", id="cost-output-tokens")
+                    yield Select(
+                        self._cost_profile_options(),
+                        id="cost-profile-select",
+                        allow_blank=False,
+                        value=self.cost_profile.name,
+                        compact=True,
+                    )
+                    yield Input(value=self.cost_profile.name, placeholder="Profile name", id="cost-profile-name")
+                    yield Input(
+                        value=self._format_number(self.cost_profile.input_per_million),
+                        placeholder="Input cost / 1M",
+                        id="cost-input-price",
+                    )
+                    yield Input(
+                        value=self._format_number(self.cost_profile.output_per_million),
+                        placeholder="Output cost / 1M",
+                        id="cost-output-price",
+                    )
+                    yield Input(
+                        value=str(self.cost_profile.estimated_output_tokens),
+                        placeholder="Output tokens",
+                        id="cost-output-tokens",
+                    )
+                    yield Button("Save", id="cost-profile-save")
+                    yield Button("Delete", id="cost-profile-delete")
                 yield Static("Enter local pricing to estimate token costs.", id="cost-summary")
             with TabPane("Repair", id=self.TAB_IDS[19]):
                 yield Button("Write patch preview", id="repair-write-preview")
@@ -331,6 +360,10 @@ class MergeTreeWidget(Vertical):
             with TabPane("Vocab Search", id=self.TAB_IDS[23]):
                 yield Input(placeholder="Search vocabulary substring", id="vocab-search")
                 yield DataTable(id="vocab-table")
+            with TabPane("Benchmark", id=self.TAB_IDS[24]):
+                yield Button("Run benchmark", id="benchmark-run")
+                yield Static("Load a tokenizer and type text to benchmark tokenization speed.", id="benchmark-summary")
+                yield DataTable(id="benchmark-table")
 
     def on_mount(self) -> None:
         self.query_one("#source-select", Select).add_class("hidden")
@@ -403,9 +436,14 @@ class MergeTreeWidget(Vertical):
         vocab_table.cursor_type = "row"
         vocab_table.add_columns("token_string", "token_id")
 
+        benchmark_table = self.query_one("#benchmark-table", DataTable)
+        benchmark_table.cursor_type = "row"
+        benchmark_table.add_columns("metric", "primary", "compare")
+
         self.set_export_format(self.export_format)
         self._sync_budget_controls()
         self._sync_chat_form()
+        self._sync_cost_controls()
         self._update_all()
 
     def _initial_budget_select_value(self) -> str:
@@ -414,6 +452,15 @@ class MergeTreeWidget(Vertical):
         value = str(self.budget_limit)
         known_values = {item[1] for item in self.BUDGET_OPTIONS}
         return value if value in known_values else "custom"
+
+    def _cost_profile_options(self) -> tuple[tuple[str, str], ...]:
+        if not self.cost_profiles:
+            self.cost_profiles = [PricingProfile("custom", 0.0, 0.0, 0)]
+        return tuple((profile.name, profile.name) for profile in self.cost_profiles)
+
+    @staticmethod
+    def _format_number(value: float) -> str:
+        return f"{value:g}"
 
     def set_engine(self, engine: TokenizerEngine | None) -> None:
         self.set_engines(engine, None)
@@ -583,8 +630,11 @@ class MergeTreeWidget(Vertical):
         self.chat_selected_index = 0
         self.add_generation_prompt = project.add_generation_prompt
         self.selected_source = project.selected_source if project.selected_source in ("primary", "compare") else "primary"
+        self._upsert_cost_profile(project.pricing_profile, persist=False)
         self._sync_chat_form()
+        self._sync_cost_controls()
         self._update_chat_budget()
+        self._update_cost()
         try:
             self.query_one("#bottom-tabs", TabbedContent).active = project.active_tab
         except Exception:
@@ -656,7 +706,7 @@ class MergeTreeWidget(Vertical):
             self.rag_overlap_tokens = max(0, self._positive_int(event.value, self.rag_overlap_tokens))
             self._update_rag()
             return
-        if event.input.id in {"cost-input-price", "cost-output-price", "cost-output-tokens"}:
+        if event.input.id in {"cost-profile-name", "cost-input-price", "cost-output-price", "cost-output-tokens"}:
             event.stop()
             self._sync_cost_profile_from_inputs()
             self._update_cost()
@@ -722,8 +772,12 @@ class MergeTreeWidget(Vertical):
             self.rag_mode = str(event.value)
             self._update_rag()
             return
+        if event.select.id == "cost-profile-select":
+            event.stop()
+            self._apply_cost_profile(str(event.value))
+            return
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "open-corpus":
             event.stop()
             self.post_message(self.CorpusBrowseRequested())
@@ -762,6 +816,15 @@ class MergeTreeWidget(Vertical):
             if result is not None:
                 write_repair_preview(result, "tokenscope_tokenizer_patch.json")
                 self._update_repair("Wrote tokenscope_tokenizer_patch.json.")
+        elif event.button.id == "cost-profile-save":
+            event.stop()
+            self._save_cost_profile()
+        elif event.button.id == "cost-profile-delete":
+            event.stop()
+            self._delete_cost_profile()
+        elif event.button.id == "benchmark-run":
+            event.stop()
+            await self._run_benchmark()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.data_table.id == "token-table":
@@ -852,6 +915,72 @@ class MergeTreeWidget(Vertical):
         finally:
             self._updating_controls = False
 
+    def _sync_cost_controls(self) -> None:
+        if self._profile_by_name(self.cost_profile.name) is None:
+            self.cost_profiles.append(self.cost_profile)
+        self._updating_controls = True
+        try:
+            profile_select = self.query_one("#cost-profile-select", Select)
+            profile_select.set_options(self._cost_profile_options())
+            profile_select.value = self.cost_profile.name
+            self.query_one("#cost-profile-name", Input).value = self.cost_profile.name
+            self.query_one("#cost-input-price", Input).value = self._format_number(
+                self.cost_profile.input_per_million
+            )
+            self.query_one("#cost-output-price", Input).value = self._format_number(
+                self.cost_profile.output_per_million
+            )
+            self.query_one("#cost-output-tokens", Input).value = str(
+                self.cost_profile.estimated_output_tokens
+            )
+        finally:
+            self._updating_controls = False
+
+    def _apply_cost_profile(self, profile_name: str) -> None:
+        profile = self._profile_by_name(profile_name)
+        if profile is None:
+            return
+        self.cost_profile = profile
+        self._sync_cost_controls()
+        self._update_cost()
+
+    def _save_cost_profile(self) -> None:
+        profile = self._sync_cost_profile_from_inputs()
+        self._upsert_cost_profile(profile, persist=True)
+        self._sync_cost_controls()
+        self._update_cost(f"Saved pricing profile {profile.name}.")
+
+    def _delete_cost_profile(self) -> None:
+        profile_name = self.cost_profile.name
+        remaining = [profile for profile in self.cost_profiles if profile.name != profile_name]
+        if not remaining:
+            remaining = [PricingProfile("custom", 0.0, 0.0, 0)]
+        self.cost_profiles = remaining
+        self.cost_profile = self.cost_profiles[0]
+        self._persist_cost_profiles()
+        self._sync_cost_controls()
+        self._update_cost(f"Deleted pricing profile {profile_name}.")
+
+    def _profile_by_name(self, profile_name: str) -> PricingProfile | None:
+        for profile in self.cost_profiles:
+            if profile.name == profile_name:
+                return profile
+        return None
+
+    def _upsert_cost_profile(self, profile: PricingProfile, *, persist: bool) -> None:
+        for index, existing in enumerate(self.cost_profiles):
+            if existing.name == profile.name:
+                self.cost_profiles[index] = profile
+                break
+        else:
+            self.cost_profiles.append(profile)
+        self.cost_profile = profile
+        if persist:
+            self._persist_cost_profiles()
+
+    def _persist_cost_profiles(self) -> None:
+        save_pricing_profiles(self.cost_profiles, Path.cwd())
+
     def _handle_chat_button(self, button_id: str) -> None:
         if button_id == "chat-toggle-generation":
             self.add_generation_prompt = not self.add_generation_prompt
@@ -939,11 +1068,13 @@ class MergeTreeWidget(Vertical):
         path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
         self.query_one("#regression-summary", Static).update(f"Added current input to {path}.")
 
-    def _sync_cost_profile_from_inputs(self) -> None:
-        input_price = self._float_input("#cost-input-price")
-        output_price = self._float_input("#cost-output-price")
+    def _sync_cost_profile_from_inputs(self) -> PricingProfile:
+        profile_name = self.query_one("#cost-profile-name", Input).value.strip() or "custom"
+        input_price = max(0.0, self._float_input("#cost-input-price"))
+        output_price = max(0.0, self._float_input("#cost-output-price"))
         output_tokens = self._positive_int(self.query_one("#cost-output-tokens", Input).value, 0)
-        self.cost_profile = PricingProfile("custom", input_price, output_price, output_tokens)
+        self.cost_profile = PricingProfile(profile_name, input_price, output_price, output_tokens)
+        return self.cost_profile
 
     def _packing_segments(self) -> tuple[tuple[str, str], ...]:
         segments: list[tuple[str, str]] = []
@@ -1527,24 +1658,23 @@ class MergeTreeWidget(Vertical):
         for bucket in result.histogram:
             table.add_row(bucket.label, str(bucket.count), bucket.bar)
 
-    def _update_cost(self) -> None:
+    def _update_cost(self, message: str | None = None) -> None:
         summary = self.query_one("#cost-summary", Static)
         estimate = self.current_cost()
         if estimate is None:
             summary.update("Enter local pricing to estimate token costs.")
             return
-        summary.update(
-            " | ".join(
-                [
-                    f"Profile: {estimate.profile_name}",
-                    f"Input tokens: {estimate.input_tokens:,}",
-                    f"Output tokens: {estimate.estimated_output_tokens:,}",
-                    f"Input cost: {estimate.input_cost:.6f}",
-                    f"Output cost: {estimate.output_cost:.6f}",
-                    f"Total: {estimate.total_cost:.6f}",
-                ]
-            )
+        details = " | ".join(
+            [
+                f"Profile: {estimate.profile_name}",
+                f"Input tokens: {estimate.input_tokens:,}",
+                f"Output tokens: {estimate.estimated_output_tokens:,}",
+                f"Input cost: {estimate.input_cost:.6f}",
+                f"Output cost: {estimate.output_cost:.6f}",
+                f"Total: {estimate.total_cost:.6f}",
+            ]
         )
+        summary.update(f"{message} | {details}" if message else details)
 
     def _update_repair(self, message: str | None = None) -> None:
         summary = self.query_one("#repair-summary", Static)
@@ -1628,6 +1758,85 @@ class MergeTreeWidget(Vertical):
             return
         for token, token_id in engine.search_vocab(query):
             table.add_row(token, str(token_id))
+
+    async def _run_benchmark(self) -> None:
+        summary = self.query_one("#benchmark-summary", Static)
+        table = self.query_one("#benchmark-table", DataTable)
+        table.clear()
+
+        result = self._selected_result()
+        if result is None or not result.input_text:
+            summary.update("Type text before running a benchmark.")
+            return
+        if self.primary_engine is None:
+            summary.update("Load a tokenizer before running a benchmark.")
+            return
+
+        summary.update("Running benchmark...")
+        text = result.input_text
+        primary_data = await asyncio.to_thread(self.primary_engine.benchmark, text, iterations=10)
+        primary_result = BenchmarkResult(**primary_data)  # type: ignore[arg-type]
+
+        compare_result: BenchmarkResult | None = None
+        if self.compare_engine is not None:
+            compare_data = await asyncio.to_thread(self.compare_engine.benchmark, text, iterations=10)
+            compare_data["source"] = "compare"
+            compare_result = BenchmarkResult(**compare_data)  # type: ignore[arg-type]
+
+        speedup: float | None = None
+        if compare_result is not None and compare_result.mean_seconds > 0:
+            speedup = compare_result.mean_seconds / primary_result.mean_seconds if primary_result.mean_seconds > 0 else None
+
+        comparison = BenchmarkComparison(
+            primary=primary_result,
+            compare=compare_result,
+            speedup=speedup,
+        )
+
+        self._update_benchmark(comparison)
+
+    def _update_benchmark(self, comparison: BenchmarkComparison) -> None:
+        summary = self.query_one("#benchmark-summary", Static)
+        table = self.query_one("#benchmark-table", DataTable)
+        table.clear()
+
+        primary = comparison.primary
+        compare = comparison.compare
+
+        def _fmt(value: float, unit: str = "") -> str:
+            if value >= 1_000_000:
+                return f"{value / 1_000_000:.2f}M{unit}"
+            if value >= 1_000:
+                return f"{value / 1_000:.2f}K{unit}"
+            return f"{value:.2f}{unit}"
+
+        metrics = [
+            ("Tokenizer", primary.tokenizer_name, compare.tokenizer_name if compare else "n/a"),
+            ("Input chars", f"{primary.input_chars:,}", f"{compare.input_chars:,}" if compare else "n/a"),
+            ("Output tokens", f"{primary.output_tokens:,}", f"{compare.output_tokens:,}" if compare else "n/a"),
+            ("Iterations", str(primary.iterations), str(compare.iterations) if compare else "n/a"),
+            ("Total time", f"{primary.total_seconds:.4f}s", f"{compare.total_seconds:.4f}s" if compare else "n/a"),
+            ("Mean time", f"{primary.mean_seconds * 1000:.3f}ms", f"{compare.mean_seconds * 1000:.3f}ms" if compare else "n/a"),
+            ("Tokens/sec", _fmt(primary.tokens_per_second, "/s"), _fmt(compare.tokens_per_second, "/s") if compare else "n/a"),
+            ("Chars/sec", _fmt(primary.chars_per_second, "/s"), _fmt(compare.chars_per_second, "/s") if compare else "n/a"),
+        ]
+
+        if comparison.speedup is not None:
+            metrics.append(("Speedup", f"{comparison.speedup:.2f}×", "baseline"))
+
+        for metric, primary_val, compare_val in metrics:
+            table.add_row(metric, primary_val, compare_val)
+
+        summary_text = (
+            f"{primary.tokenizer_name}: {_fmt(primary.tokens_per_second, ' tok/s')} | "
+            f"{primary.mean_seconds * 1000:.3f}ms/encode"
+        )
+        if compare:
+            summary_text += (
+                f" | {compare.tokenizer_name}: {_fmt(compare.tokens_per_second, ' tok/s')} | "
+                f"{compare.mean_seconds * 1000:.3f}ms/encode"
+            )
+        summary.update(summary_text)
 
     @staticmethod
     def _format_token(token: str | None, token_id: int | None) -> str:

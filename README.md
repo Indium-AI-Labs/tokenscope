@@ -4,11 +4,11 @@
 
 `tokenscope` is an offline terminal tokenizer explorer for local HuggingFace tokenizer files. It loads tokenizer folders from disk, lets you type text interactively, and shows colored token spans, token IDs, vocabulary stats, token inspection, decode round-trip checks, special-token metadata, prompt and chat-template budgets, corpus analysis, batch prompt analysis, tokenizer pipeline debugging, tokenizer diffs, packing simulation, regression suites, Unicode inspection, RAG chunking, distribution summaries, cost estimates, repair suggestions, BPE merge reconstruction, vocabulary search, and optional side-by-side tokenizer comparison.
 
-No runtime network calls are made. The app uses HuggingFace `tokenizers` directly and does not depend on `transformers`.
+No runtime network calls are made unless you explicitly request a HuggingFace Hub download with `--hub`, Load from Hub, or `default_hub_model` in config. The app uses HuggingFace `tokenizers` directly and does not depend on `transformers`.
 
 ## Release
 
-The v0.1.0 changelog is in [changelog_v0.1.0.md](changelog_v0.1.0.md).
+The v0.1.0 changelog is in [changelogs/changelog_v0.1.0.md](changelogs/changelog_v0.1.0.md).
 
 Prebuilt Linux and Windows binaries are attached to GitHub Releases. macOS binaries are built by the macOS GitHub Actions runner or on a macOS host.
 
@@ -68,10 +68,22 @@ Load a saved TokenScope project:
 python main.py --project ./tokenscope_project.json
 ```
 
-Run headless analysis for scripts or CI:
+Run headless analysis for scripts or CI (supports inline input, file input, or piping via stdin):
 
 ```bash
 python main.py analyze --tokenizer ./gpt2-local --input-file ./prompt.txt --budget 8192 --export report.html --export-format html
+```
+
+You can also download and load a tokenizer from the HuggingFace Hub directly at launch:
+
+```bash
+python main.py --hub meta-llama/Llama-3.1-8B
+```
+
+Or run headless analysis with stdin piping:
+
+```bash
+cat prompt.txt | python main.py analyze --tokenizer ./gpt2-local --stdin --export report.json
 ```
 
 If `--tokenizer` is omitted, `tokenscope` opens a folder browser inside the TUI. Interactive tokenizer loading selects folders only. CLI loading can use either folders or direct `tokenizer.json` paths.
@@ -85,6 +97,29 @@ Supported local tokenizer layouts include:
 
 The corpus and batch browsers accept local `.txt`, `.md`, `.jsonl`, `.json`, and `.csv` files, plus folders containing those files.
 
+## Configuration Files
+
+`tokenscope` supports loading persistent default settings from a `.tokenscoperc` or `tokenscope.json` file. It searches for configuration files in the current workspace directory first, falling back to the user's home directory.
+
+You can initialize a default configuration template in your current directory using the `init-config` subcommand:
+
+```bash
+python main.py init-config
+```
+
+Example `.tokenscoperc` configuration file:
+
+```json
+{
+  "default_tokenizer": "./gpt2-local",
+  "default_budget": 4096,
+  "default_export_format": "json",
+  "default_hub_model": "gpt2",
+  "hub_cache_dir": null,
+  "encode_special_tokens": false
+}
+```
+
 ## Keyboard Shortcuts
 
 - `Ctrl+L`: clear input
@@ -96,6 +131,7 @@ The corpus and batch browsers accept local `.txt`, `.md`, `.jsonl`, `.json`, and
 - `Ctrl+F`: focus token search
 - `Ctrl+B`: focus prompt budget input
 - `Ctrl+T`: toggle encode-special-tokens mode and re-tokenize
+- `Ctrl+Y`: copy space-separated primary token IDs to the system clipboard
 - `Ctrl+S`: save the current export as JSON, CSV, Markdown, or HTML based on the export selector
 - `Ctrl+C` or `q`: quit
 
@@ -133,6 +169,7 @@ Folder browser controls:
 - Merge Tree: BPE-only best-effort ASCII merge tree reconstruction from merge ranks, including byte-level BPE symbols
 - Pipeline: normalized text, pre-tokenizer splits, model tokens, token IDs, and decoded text for the active input
 - Vocab Search: substring search over tokenizer vocabulary
+- Benchmark: interactive tokenization speed benchmark with primary-vs-compare comparisons
 
 In Compare Mode, the input is shared. The primary and compare tokenizers update together, the token views are shown side by side, and the stats panel shows token count, compression, boundary, token, and ID deltas.
 

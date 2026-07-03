@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from tokenizers import AddedToken, Tokenizer, models, pre_tokenizers, trainers
 
@@ -82,7 +83,7 @@ class AppSmokeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn("tokenscope 0.1.0", completed.stdout)
+        self.assertIn("tokenscope 0.2.0", completed.stdout)
 
     async def test_startup_browser_appears_without_cli_tokenizer(self) -> None:
         app = TokenscopeApp()
@@ -90,6 +91,44 @@ class AppSmokeTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.2)
             self.assertFalse(app.query_one("#browser-screen").has_class("hidden"))
             self.assertTrue(app.query_one("#main-layout").has_class("hidden"))
+
+    async def test_config_encode_special_tokens_initializes_app(self) -> None:
+        app = TokenscopeApp(encode_special_tokens=True)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(0.2)
+            self.assertTrue(app.encode_special_tokens)
+            self.assertTrue(app.query_one("#bottom-panel", MergeTreeWidget).encode_special_tokens)
+
+    async def test_hub_download_handler_requests_tokenizer_load(self) -> None:
+        app = TokenscopeApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(0.2)
+            mock_engine = MagicMock()
+            mock_engine.source_path = Path("cached") / "gpt2"
+            with (
+                patch("main.TokenizerEngine.load_from_hub", return_value=mock_engine) as mock_load,
+                patch.object(app, "_request_tokenizer_load") as mock_request,
+            ):
+                await app.on_folder_browser_hub_download_requested(
+                    FolderBrowser.HubDownloadRequested("gpt2")
+                )
+
+            mock_load.assert_called_once_with("gpt2", cache_dir=None)
+            mock_request.assert_called_once_with(str(mock_engine.source_path), "primary", from_cli=False)
+
+    async def test_hub_controls_hidden_for_corpus_browser(self) -> None:
+        app = TokenscopeApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(0.2)
+            app._open_browser("corpus")
+            self.assertTrue(app.query_one("#hub-controls").has_class("hidden"))
+
+            with patch("main.TokenizerEngine.load_from_hub") as mock_load:
+                await app.on_folder_browser_hub_download_requested(
+                    FolderBrowser.HubDownloadRequested("gpt2")
+                )
+
+            mock_load.assert_not_called()
 
     async def test_folder_browser_selection_loads_primary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -349,6 +388,36 @@ class AppSmokeTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 os.chdir(original_cwd)
 
+    async def test_cost_profile_save_and_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            original_cwd = Path.cwd()
+            try:
+                os.chdir(workspace)
+                app = TokenscopeApp()
+                async with app.run_test(size=(150, 45)) as pilot:
+                    await pilot.pause(0.2)
+                    bottom = app.query_one("#bottom-panel", MergeTreeWidget)
+                    bottom.query_one("#cost-profile-name").value = "team"
+                    bottom.query_one("#cost-input-price").value = "1.5"
+                    bottom.query_one("#cost-output-price").value = "4"
+                    bottom.query_one("#cost-output-tokens").value = "250"
+                    bottom._save_cost_profile()
+                    await pilot.pause(0.1)
+
+                saved = json.loads((workspace / ".tokenscope_pricing.json").read_text(encoding="utf-8"))
+                self.assertIn("team", [profile["name"] for profile in saved["profiles"]])
+
+                app = TokenscopeApp()
+                async with app.run_test(size=(150, 45)) as pilot:
+                    await pilot.pause(0.2)
+                    bottom = app.query_one("#bottom-panel", MergeTreeWidget)
+                    bottom._apply_cost_profile("team")
+                    self.assertEqual(bottom.cost_profile.name, "team")
+                    self.assertEqual(bottom.cost_profile.output_per_million, 4.0)
+            finally:
+                os.chdir(original_cwd)
+
     async def test_headless_cli_analyze_exports_new_sections(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -384,6 +453,42 @@ class AppSmokeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("rag_chunking", payload)
             self.assertIn("cost", payload)
             self.assertIn("repair", payload)
+
+    async def test_headless_cli_analyze_uses_config_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            root = make_tokenizer_dir(workspace / "primary", ["hello world alpha beta"])
+            output = workspace / "report.md"
+            (workspace / ".tokenscoperc").write_text(
+                json.dumps(
+                    {
+                        "default_tokenizer": str(root),
+                        "default_budget": 8,
+                        "default_export_format": "md",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve().parents[1] / "main.py"),
+                    "analyze",
+                    "--input",
+                    "hello world",
+                    "--export",
+                    str(output),
+                ],
+                cwd=workspace,
+                text=True,
+                capture_output=True,
+                timeout=30,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            exported = output.read_text(encoding="utf-8")
+            self.assertIn("## Token Table", exported)
 
 
 if __name__ == "__main__":
