@@ -105,6 +105,9 @@ jobs:
           if [ "$TAG_NAME" = "v0.1.0" ]; then
             release_title="tokenscope v0.1"
           fi
+          if [ "$TAG_NAME" = "v1.0.0" ]; then
+            release_title="tokenscope v1.0"
+          fi
           mapfile -t assets < <(find artifacts -type f -name "tokenscope-*" | sort)
           if gh release view "$TAG_NAME" >/dev/null 2>&1; then
             gh release edit "$TAG_NAME" --title "$release_title" --notes-file "$notes_file"

@@ -841,6 +841,8 @@ class MergeTreeWidget(Vertical):
         if event.data_table.id != "token-table":
             return
         event.stop()
+        if not event.data_table.has_focus:
+            return
         self._select_row(event.cursor_row)
 
     def _update_all(self) -> None:

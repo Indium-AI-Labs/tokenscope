@@ -83,7 +83,7 @@ class AppSmokeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn("tokenscope 0.2.0", completed.stdout)
+        self.assertIn("tokenscope 1.0.0", completed.stdout)
 
     async def test_startup_browser_appears_without_cli_tokenizer(self) -> None:
         app = TokenscopeApp()
