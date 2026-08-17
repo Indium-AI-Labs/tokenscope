@@ -1,6 +1,6 @@
 # tokenscope
 
-![tokenscope banner](banner.png)
+![tokenscope banner](banner2.png)
 
 `tokenscope` is an offline terminal tokenizer explorer for local HuggingFace tokenizer files. It loads tokenizer folders from disk, lets you type text interactively, and shows colored token spans, token IDs, vocabulary stats, token inspection, decode round-trip checks, special-token metadata, prompt and chat-template budgets, corpus analysis, batch prompt analysis, tokenizer pipeline debugging, tokenizer diffs, packing simulation, regression suites, Unicode inspection, RAG chunking, distribution summaries, cost estimates, repair suggestions, BPE merge reconstruction, vocabulary search, and optional side-by-side tokenizer comparison.
 
